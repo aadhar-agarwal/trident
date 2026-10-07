@@ -237,8 +237,9 @@ rollout prerequisite; compilation and offline tests do not establish it.
 After booting the expected target, Trident logs ACL's version-1 structured
 `/run/acl/usr-verity.json` diagnostic (`slot`, `rootHash`, `requestedMode`,
 `verification`, `reason`). A `verified` report is cross-checked against the live
-signature-verified mapping; `degraded` is never reported as verified. Audit
-fallback, tag-off and IMDS-unavailable boots retain existing availability-first
+signature-verified mapping; `degraded` is never reported as verified. An IMDS
+lookup failure is reported as `requestedMode=unavailable`, `verification=degraded`.
+Audit fallback, tag-off and IMDS-unavailable boots retain existing availability-first
 completion and health-check policies. **No new automatic rollback condition is
 introduced for degraded verification.** This runtime report is never used to
 accept an update preflight.

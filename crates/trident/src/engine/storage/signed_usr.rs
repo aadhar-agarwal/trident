@@ -299,25 +299,6 @@ pub(crate) fn prepare(ctx: &EngineContext) -> Result<Option<SignedUsrUpdate>, Er
             }
         }
     }
-    if ctx.image_distro().is_acl() && templates.exists() {
-        let target = Slot::from_volume(ctx.get_ab_update_volume().context("No update slot")?);
-        let usr = image
-            .filesystems()
-            .find(|fs| fs.mount_point == Path::new(USR_MOUNT_POINT_PATH))
-            .context("ACL slot addon requires a /usr image")?;
-        let root = usr
-            .verity
-            .as_ref()
-            .context("ACL slot addon requires /usr verity")?;
-        // Also protect policy-only slot addons, without imposing the new
-        // signature format or GPT-layout contract on legacy images.
-        let target_root = argument(&cmdlines[usize::from(target == Slot::B)], ROOT_HASH)?
-            .context("Target slot addon has no usrhash")?;
-        ensure!(
-            target_root.eq_ignore_ascii_case(&root.roothash),
-            "Target slot addon root does not match the selected /usr payload"
-        );
-    }
     if !marked {
         return Ok(None);
     }
@@ -691,223 +672,6 @@ fn validate_destination(
     Ok(())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    use trident_api::{
-        config::{AbUpdate, AbVolumePair, Disk, Partition},
-        primitives::hash::Sha384Hash,
-    };
-
-    use crate::osimage::{mock::MockOsImage, GptPartitionInfo, OsImage};
-
-    fn file(path: &str) -> OsImageFile {
-        OsImageFile {
-            path: path.into(),
-            sha384: Sha384Hash::from("0".repeat(96).as_str()),
-            compressed_size: 42,
-            uncompressed_size: 4096,
-        }
-    }
-
-    fn partition(label: &str) -> OsImagePartition {
-        OsImagePartition {
-            image_file: file(label),
-            info: GptPartitionInfo {
-                name: label.to_owned(),
-                part_uuid: Uuid::new_v4(),
-                part_type: DiscoverablePartitionType::Usr.resolve(),
-                size: 4096,
-                first_lba: 10,
-                last_lba: 17,
-                flags: 0,
-                partition_number: 1,
-            },
-        }
-    }
-
-    fn partitions() -> Vec<OsImagePartition> {
-        [
-            "USR-A",
-            "HASH-A",
-            "HASH-SIG-A",
-            "USR-B",
-            "HASH-B",
-            "HASH-SIG-B",
-        ]
-        .into_iter()
-        .map(partition)
-        .collect()
-    }
-
-    fn cmdline(slot: Slot, hash: &str, signed: bool) -> String {
-        let marker = if signed {
-            format!(" {SIGNATURE_MARKER}=PARTUUID={}", slot.signature_uuid())
-        } else {
-            String::new()
-        };
-        format!("usrhash={hash} systemd.verity_usr_data=PARTUUID={} systemd.verity_usr_hash=PARTUUID={}{marker}",
-                    Uuid::from_u128(1), Uuid::from_u128(2))
-    }
-
-    #[test]
-    fn signed_and_legacy_addons_are_distinct() {
-        let hash = "a".repeat(64);
-        assert_eq!(
-            Addon::parse(&cmdline(Slot::A, &hash, true))
-                .unwrap()
-                .signature,
-            Some(Slot::A.signature_uuid())
-        );
-        assert!(Addon::parse(&cmdline(Slot::A, &hash, false))
-            .unwrap()
-            .signature
-            .is_none());
-        for bad in [
-            format!("{} usrhash={hash}", cmdline(Slot::A, &hash, true)),
-            format!("{} {SIGNATURE_MARKER}", cmdline(Slot::A, &hash, true)),
-            format!(
-                "{} systemd.verity_usr_options=root-hash-signature=/boot/old.der",
-                cmdline(Slot::A, &hash, true)
-            ),
-            cmdline(Slot::A, "short", true),
-        ] {
-            Addon::parse(&bad).unwrap_err();
-        }
-    }
-
-    #[test]
-    fn source_slot_is_not_destination_slot() {
-        let parts = partitions();
-        for source in [Slot::A, Slot::B] {
-            let data = file(&format!("USR-{}", source.suffix()));
-            let hash = file(&format!("HASH-{}", source.suffix()));
-            let actual = select_source(&parts, &data, &hash).unwrap();
-            assert_eq!(actual, source);
-            for destination in [Slot::A, Slot::B] {
-                let signature =
-                    partition_by_label(&parts, &format!("HASH-SIG-{}", actual.suffix())).unwrap();
-                assert_eq!(
-                    signature.image_file.path,
-                    Path::new(&format!("HASH-SIG-{}", source.suffix()))
-                );
-                assert_eq!(
-                    destination.signature_uuid(),
-                    if destination == Slot::A {
-                        acl::ACL_HASH_SIG_A_PARTUUID
-                    } else {
-                        acl::ACL_HASH_SIG_B_PARTUUID
-                    }
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn rejects_target_addon_with_different_root_even_when_source_is_valid() {
-        let root = "a".repeat(64);
-        let source = Addon::parse(&cmdline(Slot::A, &root, true)).unwrap();
-        let matching_target = Addon::parse(&cmdline(Slot::B, &root, true)).unwrap();
-        validate_roots(&source, &matching_target, &root).unwrap();
-        let different_target = Addon::parse(&cmdline(Slot::B, &"b".repeat(64), true)).unwrap();
-        validate_roots(&source, &different_target, &root).unwrap_err();
-        validate_roots(&source, &matching_target, &"c".repeat(64)).unwrap_err();
-    }
-
-    #[test]
-    fn rejects_cross_slot_tree_missing_and_ambiguous_identity() {
-        let mut parts = partitions();
-        select_source(&parts, &file("USR-A"), &file("HASH-B")).unwrap_err();
-        let mut mismatched = file("HASH-A");
-        mismatched.uncompressed_size += 1;
-        select_source(&parts, &file("USR-A"), &mismatched).unwrap_err();
-        parts.remove(2);
-        partition_by_label(&parts, "HASH-SIG-A").unwrap_err();
-        let duplicate_uuid = parts[0].info.part_uuid;
-        parts[1].info.part_uuid = duplicate_uuid;
-        validate_unique_partitions(&parts).unwrap_err();
-    }
-
-    fn context() -> EngineContext {
-        let mut ctx = EngineContext {
-            servicing_type: ServicingType::AbUpdate,
-            ab_active_volume: Some(AbVolumeSelection::VolumeA),
-            ..Default::default()
-        };
-        let mut a = Partition::new("sig-a", 4096u64);
-        a.uuid = Some(Slot::A.signature_uuid());
-        let mut b = Partition::new("sig-b", 4096u64);
-        b.uuid = Some(Slot::B.signature_uuid());
-        ctx.spec.storage.disks = vec![Disk {
-            partitions: vec![a, b],
-            ..Default::default()
-        }];
-        ctx.spec.storage.ab_update = Some(AbUpdate {
-            volume_pairs: vec![AbVolumePair {
-                id: "sig".to_owned(),
-                volume_a_id: "sig-a".to_owned(),
-                volume_b_id: "sig-b".to_owned(),
-            }],
-        });
-        ctx
-    }
-
-    #[test]
-    fn inactive_signature_selection_preserves_active_and_rollback() {
-        let mut ctx = context();
-        for (active, target, expected) in [
-            (AbVolumeSelection::VolumeA, Slot::B, "sig-b"),
-            (AbVolumeSelection::VolumeB, Slot::A, "sig-a"),
-        ] {
-            ctx.ab_active_volume = Some(active);
-            assert_eq!(
-                Slot::from_volume(ctx.get_ab_update_volume().unwrap()),
-                target
-            );
-            assert_eq!(signature_destination(&ctx, target).unwrap(), expected);
-        }
-        let pair = &mut ctx.spec.storage.ab_update.as_mut().unwrap().volume_pairs[0];
-        std::mem::swap(&mut pair.volume_a_id, &mut pair.volume_b_id);
-        signature_destination(&ctx, Slot::A).unwrap_err();
-    }
-
-    #[test]
-    fn unmarked_legacy_non_uki_image_does_not_require_signatures() {
-        let ctx = EngineContext {
-            image: Some(OsImage::mock(MockOsImage::new())),
-            ..Default::default()
-        };
-        assert!(prepare(&ctx).unwrap().is_none());
-    }
-
-    #[test]
-    fn runtime_status_is_diagnostic_not_a_fallback_success() {
-        for (mode, verification) in [
-            ("off", "not-requested"),
-            ("unavailable", "not-requested"),
-            ("audit", "degraded"),
-            ("audit", "verified"),
-        ] {
-            let status = RuntimeStatus {
-                version: 1,
-                slot: "b".into(),
-                root_hash: "a".repeat(64),
-                requested_mode: mode.into(),
-                verification: verification.into(),
-                reason: "test".into(),
-            };
-            status.validate(Slot::B).unwrap();
-            status.validate(Slot::A).unwrap_err();
-            let invalid = RuntimeStatus {
-                requested_mode: "off".into(),
-                verification: "verified".into(),
-                ..status
-            };
-            invalid.validate(Slot::B).unwrap_err();
-        }
-    }
-}
 const RUNTIME_STATUS_PATH: &str = "/run/acl/usr-verity.json";
 const MAX_RUNTIME_STATUS_SIZE: u64 = 16 * 1024;
 
@@ -935,7 +699,9 @@ impl RuntimeStatus {
         ensure!(
             matches!(
                 (self.requested_mode.as_str(), self.verification.as_str()),
-                ("audit", "verified" | "degraded") | ("off" | "unavailable", "not-requested")
+                ("audit", "verified" | "degraded")
+                    | ("off", "not-requested")
+                    | ("unavailable", "degraded")
             ),
             "Inconsistent signed /usr runtime mode/verification"
         );
@@ -1300,6 +1066,224 @@ impl SignedUsrUpdate {
             return Err(e);
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use trident_api::{
+        config::{AbUpdate, AbVolumePair, Disk, Partition},
+        primitives::hash::Sha384Hash,
+    };
+
+    use crate::osimage::{mock::MockOsImage, GptPartitionInfo, OsImage};
+
+    fn file(path: &str) -> OsImageFile {
+        OsImageFile {
+            path: path.into(),
+            sha384: Sha384Hash::from("0".repeat(96).as_str()),
+            compressed_size: 42,
+            uncompressed_size: 4096,
+        }
+    }
+
+    fn partition(label: &str) -> OsImagePartition {
+        OsImagePartition {
+            image_file: file(label),
+            info: GptPartitionInfo {
+                name: label.to_owned(),
+                part_uuid: Uuid::new_v4(),
+                part_type: DiscoverablePartitionType::Usr.resolve(),
+                size: 4096,
+                first_lba: 10,
+                last_lba: 17,
+                flags: 0,
+                partition_number: 1,
+            },
+        }
+    }
+
+    fn partitions() -> Vec<OsImagePartition> {
+        [
+            "USR-A",
+            "HASH-A",
+            "HASH-SIG-A",
+            "USR-B",
+            "HASH-B",
+            "HASH-SIG-B",
+        ]
+        .into_iter()
+        .map(partition)
+        .collect()
+    }
+
+    fn cmdline(slot: Slot, hash: &str, signed: bool) -> String {
+        let marker = if signed {
+            format!(" {SIGNATURE_MARKER}=PARTUUID={}", slot.signature_uuid())
+        } else {
+            String::new()
+        };
+        format!("usrhash={hash} systemd.verity_usr_data=PARTUUID={} systemd.verity_usr_hash=PARTUUID={}{marker}",
+                    Uuid::from_u128(1), Uuid::from_u128(2))
+    }
+
+    #[test]
+    fn signed_and_legacy_addons_are_distinct() {
+        let hash = "a".repeat(64);
+        assert_eq!(
+            Addon::parse(&cmdline(Slot::A, &hash, true))
+                .unwrap()
+                .signature,
+            Some(Slot::A.signature_uuid())
+        );
+        assert!(Addon::parse(&cmdline(Slot::A, &hash, false))
+            .unwrap()
+            .signature
+            .is_none());
+        for bad in [
+            format!("{} usrhash={hash}", cmdline(Slot::A, &hash, true)),
+            format!("{} {SIGNATURE_MARKER}", cmdline(Slot::A, &hash, true)),
+            format!(
+                "{} systemd.verity_usr_options=root-hash-signature=/boot/old.der",
+                cmdline(Slot::A, &hash, true)
+            ),
+            cmdline(Slot::A, "short", true),
+        ] {
+            Addon::parse(&bad).unwrap_err();
+        }
+    }
+
+    #[test]
+    fn source_slot_is_not_destination_slot() {
+        let parts = partitions();
+        for source in [Slot::A, Slot::B] {
+            let data = file(&format!("USR-{}", source.suffix()));
+            let hash = file(&format!("HASH-{}", source.suffix()));
+            let actual = select_source(&parts, &data, &hash).unwrap();
+            assert_eq!(actual, source);
+            for destination in [Slot::A, Slot::B] {
+                let signature =
+                    partition_by_label(&parts, &format!("HASH-SIG-{}", actual.suffix())).unwrap();
+                assert_eq!(
+                    signature.image_file.path,
+                    Path::new(&format!("HASH-SIG-{}", source.suffix()))
+                );
+                assert_eq!(
+                    destination.signature_uuid(),
+                    if destination == Slot::A {
+                        acl::ACL_HASH_SIG_A_PARTUUID
+                    } else {
+                        acl::ACL_HASH_SIG_B_PARTUUID
+                    }
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn rejects_target_addon_with_different_root_even_when_source_is_valid() {
+        let root = "a".repeat(64);
+        let source = Addon::parse(&cmdline(Slot::A, &root, true)).unwrap();
+        let matching_target = Addon::parse(&cmdline(Slot::B, &root, true)).unwrap();
+        validate_roots(&source, &matching_target, &root).unwrap();
+        let different_target = Addon::parse(&cmdline(Slot::B, &"b".repeat(64), true)).unwrap();
+        validate_roots(&source, &different_target, &root).unwrap_err();
+        validate_roots(&source, &matching_target, &"c".repeat(64)).unwrap_err();
+    }
+
+    #[test]
+    fn rejects_cross_slot_tree_missing_and_ambiguous_identity() {
+        let mut parts = partitions();
+        select_source(&parts, &file("USR-A"), &file("HASH-B")).unwrap_err();
+        let mut mismatched = file("HASH-A");
+        mismatched.uncompressed_size += 1;
+        select_source(&parts, &file("USR-A"), &mismatched).unwrap_err();
+        parts.remove(2);
+        partition_by_label(&parts, "HASH-SIG-A").unwrap_err();
+        let duplicate_uuid = parts[0].info.part_uuid;
+        parts[1].info.part_uuid = duplicate_uuid;
+        validate_unique_partitions(&parts).unwrap_err();
+    }
+
+    fn context() -> EngineContext {
+        let mut ctx = EngineContext {
+            servicing_type: ServicingType::AbUpdate,
+            ab_active_volume: Some(AbVolumeSelection::VolumeA),
+            ..Default::default()
+        };
+        let mut a = Partition::new("sig-a", 4096u64);
+        a.uuid = Some(Slot::A.signature_uuid());
+        let mut b = Partition::new("sig-b", 4096u64);
+        b.uuid = Some(Slot::B.signature_uuid());
+        ctx.spec.storage.disks = vec![Disk {
+            partitions: vec![a, b],
+            ..Default::default()
+        }];
+        ctx.spec.storage.ab_update = Some(AbUpdate {
+            volume_pairs: vec![AbVolumePair {
+                id: "sig".to_owned(),
+                volume_a_id: "sig-a".to_owned(),
+                volume_b_id: "sig-b".to_owned(),
+            }],
+        });
+        ctx
+    }
+
+    #[test]
+    fn inactive_signature_selection_preserves_active_and_rollback() {
+        let mut ctx = context();
+        for (active, target, expected) in [
+            (AbVolumeSelection::VolumeA, Slot::B, "sig-b"),
+            (AbVolumeSelection::VolumeB, Slot::A, "sig-a"),
+        ] {
+            ctx.ab_active_volume = Some(active);
+            assert_eq!(
+                Slot::from_volume(ctx.get_ab_update_volume().unwrap()),
+                target
+            );
+            assert_eq!(signature_destination(&ctx, target).unwrap(), expected);
+        }
+        let pair = &mut ctx.spec.storage.ab_update.as_mut().unwrap().volume_pairs[0];
+        std::mem::swap(&mut pair.volume_a_id, &mut pair.volume_b_id);
+        signature_destination(&ctx, Slot::A).unwrap_err();
+    }
+
+    #[test]
+    fn unmarked_legacy_non_uki_image_does_not_require_signatures() {
+        let ctx = EngineContext {
+            image: Some(OsImage::mock(MockOsImage::new())),
+            ..Default::default()
+        };
+        assert!(prepare(&ctx).unwrap().is_none());
+    }
+
+    #[test]
+    fn runtime_status_is_diagnostic_not_a_fallback_success() {
+        for (mode, verification) in [
+            ("off", "not-requested"),
+            ("unavailable", "degraded"),
+            ("audit", "degraded"),
+            ("audit", "verified"),
+        ] {
+            let status = RuntimeStatus {
+                version: 1,
+                slot: "b".into(),
+                root_hash: "a".repeat(64),
+                requested_mode: mode.into(),
+                verification: verification.into(),
+                reason: "test".into(),
+            };
+            status.validate(Slot::B).unwrap();
+            status.validate(Slot::A).unwrap_err();
+            let invalid = RuntimeStatus {
+                requested_mode: "off".into(),
+                verification: "verified".into(),
+                ..status
+            };
+            invalid.validate(Slot::B).unwrap_err();
+        }
     }
 }
 
