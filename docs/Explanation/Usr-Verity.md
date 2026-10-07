@@ -142,10 +142,34 @@ The raw GPT partitions are `HASH-SIG-A` (PARTUUID
 DPS `/usr` verity-signature type (x64 `e7bb33fb-06cf-4e81-8273-e543b413e2e2`;
 arm64 `c23ce4ff-44bd-4b00-b2d4-b41b3419e02a`). COSI's existing GPT-to-image
 association carries these unmounted partitions; no schema extension is needed.
-Each payload is JSON with exactly `rootHash` (64 lowercase ASCII hexadecimal
-characters) and `signature` (canonical Base64 detached DER CMS). CMS signs
-exactly those 64 ASCII characters, without a newline. NUL padding extends the
-payload to a multiple of 4096 bytes, at most 1 MiB.
+Each initialized signature partition contains JSON with exactly `rootHash`
+(64 lowercase ASCII hexadecimal characters) and `signature` (canonical Base64
+detached DER CMS). CMS signs exactly those 64 ASCII characters, without a
+newline. NUL padding extends the payload to a multiple of 4096 bytes, at most
+1 MiB.
+
+Factory signed images retain the existing **A-active/B-empty** layout. Only
+`USR-A`/`HASH-A` are initialized and only `HASH-SIG-A` contains a signature;
+`USR-B`, `HASH-B`, and `HASH-SIG-B` remain zero-filled reserved partitions.
+Publication metadata records `"initialized_slots": ["a"]`. Both pre-signed
+addon templates still carry the source-A root hash and their respective slot's
+data, hash, and signature PARTUUIDs. A template's capability marker does not
+mean its slot is initialized or bootable. Do not clone A's btrfs filesystem
+into factory B: that duplicates `/usr/share/ic/etc/fstab` and causes the pinned
+Image Customizer to discover two rootfs candidates before verity PARTUUID
+selection.
+
+COSI must include the reserved B partitions in its GPT/image association, with
+full partition-sized zero-filled images, not omitted or zero-length payloads.
+Trident checks both slots' identities and image sizes, but extracts and
+cryptographically verifies only the tuple selected by COSI's actual `/usr`
+data/tree association. For these factory artifacts that is A, including
+`HASH-SIG-A`; it does not require valid data or a signature in inactive B.
+The first A-to-B update writes that source-A tuple into destination
+`USR-B`/`HASH-B`/`HASH-SIG-B`, then verifies it before switching boot assets.
+B's signature partition must have the same capacity as the selected source
+signature image. A's existing tuple remains untouched for rollback. Later
+updates likewise select by source payload, not by the destination slot letter.
 
 Before any inactive-slot write, Trident validates source GPT identity, capacity,
 data/tree association, both slot capabilities, the actual destination GPT and
