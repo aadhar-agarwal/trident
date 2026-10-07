@@ -17,6 +17,7 @@ pub mod image;
 pub mod partitioning;
 pub mod raid;
 pub mod rebuild;
+pub(crate) mod signed_usr;
 mod swap;
 pub mod verity;
 
@@ -60,9 +61,12 @@ pub(super) fn close_pre_existing_devices(ctx: &EngineContext) -> Result<(), Trid
 }
 
 #[tracing::instrument(skip_all)]
-pub(super) fn initialize_block_devices(ctx: &EngineContext) -> Result<(), TridentError> {
+pub(super) fn initialize_block_devices(
+    ctx: &EngineContext,
+    signed_usr: Option<&signed_usr::SignedUsrUpdate>,
+) -> Result<(), TridentError> {
     // Deploy images on block devices as specified in the configuration.
-    image::deploy_images(ctx)?;
+    image::deploy_images(ctx, signed_usr)?;
 
     // Create filesystems on block devices as specified in the configuration.
     filesystem::create_filesystems(ctx).structured(ServicingError::CreateFilesystems)?;
@@ -72,7 +76,13 @@ pub(super) fn initialize_block_devices(ctx: &EngineContext) -> Result<(), Triden
 
     // Assumes that images are already in place (data and hash), so that it can
     // assemble the verity devices.
-    verity::setup_verity_devices(ctx).structured(ServicingError::CreateVerity)?;
+    if let Some(signed_usr) = signed_usr {
+        signed_usr
+            .open_staged(ctx)
+            .structured(ServicingError::CreateVerity)?;
+    } else {
+        verity::setup_verity_devices(ctx).structured(ServicingError::CreateVerity)?;
+    }
 
     // Force the kernel to rescan all block devices and wait for udev to process the events.
     // This clears stale partition UUIDs from previous installations that may still be in

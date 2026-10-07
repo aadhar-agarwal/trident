@@ -1,5 +1,6 @@
 use std::{
     collections::HashMap,
+    fs::File,
     io::Read,
     ops::ControlFlow,
     path::{Path, PathBuf},
@@ -24,10 +25,15 @@ use crate::{
     osimage::{OsImageFile, OsImagePartition},
 };
 
+use super::signed_usr::SignedUsrUpdate;
+
 /// Deploys all the filesystem images sourced from the OS Image to the
 /// corresponding block devices.
 #[tracing::instrument(name = "image_provision", skip_all)]
-pub(super) fn deploy_images(ctx: &EngineContext) -> Result<(), TridentError> {
+pub(super) fn deploy_images(
+    ctx: &EngineContext,
+    signed_usr: Option<&SignedUsrUpdate>,
+) -> Result<(), TridentError> {
     // Depending on the type of servicing, get the list of filesystems and
     // partitions sourced from the OS image that we need to deploy.
     let (fs_from_img, partitions_from_img) = if !ctx.is_stream_image {
@@ -152,6 +158,33 @@ pub(super) fn deploy_images(ctx: &EngineContext) -> Result<(), TridentError> {
                 FileSystemResize::NoResize,
             ),
         );
+    }
+
+    if let Some(signed_usr) = signed_usr {
+        // The cache binds data, tree and raw HASH-SIG to one source payload,
+        // independently of the inactive destination's slot letter. Never
+        // re-fetch these artifacts between preflight and destructive writes.
+        for cache in signed_usr.images.iter().take(2) {
+            if !combined_images
+                .get(&cache.image.path)
+                .is_some_and(|(id, _, _, _)| id == &cache.id)
+            {
+                return Err(TridentError::internal(
+                    "Signed /usr preflight and filesystem deployment mapping disagree",
+                ));
+            }
+        }
+        for cache in &signed_usr.images {
+            combined_images.remove(&cache.image.path);
+            deploy_os_image_file(
+                ctx,
+                &cache.id,
+                &cache.image,
+                FileSystemResize::NoResize,
+                File::open(cache.compressed.path()).structured(ServicingError::DeployImages)?,
+            )
+            .structured(ServicingError::DeployImages)?;
+        }
     }
 
     // Get the threshold and interval for reporting slow streaming speed from

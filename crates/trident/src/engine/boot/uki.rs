@@ -346,15 +346,45 @@ pub fn update_uki_boot_order(
     let entry_name =
         update_uki_boot_files(ctx, esp_dir_path).message("Failed to update UKI boot files")?;
 
+    select_uki_boot_entry(&entry_name, oneshot)
+}
+
+pub(crate) fn select_uki_boot_entry(entry_name: &str, oneshot: bool) -> Result<(), TridentError> {
     if oneshot {
         debug!("Setting oneshot boot entry to '{entry_name}'");
-        efivar::set_oneshot(&entry_name)?;
+        efivar::set_oneshot(entry_name)?;
     } else {
         debug!("Setting default boot entry to '{entry_name}'");
-        efivar::set_default(&entry_name)?;
+        efivar::set_default(entry_name)?;
     }
 
     Ok(())
+}
+
+fn next_uki_name(
+    ctx: &EngineContext,
+    existing: &[(usize, String, PathBuf)],
+) -> Result<String, Error> {
+    let suffix = uki_suffix(ctx);
+    let next_index = existing
+        .iter()
+        .filter(|(_, existing_suffix, _)| existing_suffix != &suffix)
+        .map(|(index, _, _)| *index)
+        .max()
+        .unwrap_or(99)
+        .max(99)
+        .checked_add(1)
+        .context("UKI update index overflow")?;
+    Ok(format!("{UKI_FILENAME_PREFIX}{next_index}-{suffix}"))
+}
+
+/// Choose the destination without changing any assets, so signed servicing can
+/// persist it before the non-atomic addon/UKI rename sequence.
+pub(crate) fn planned_uki_name(ctx: &EngineContext, esp: &Path) -> Result<String, Error> {
+    next_uki_name(
+        ctx,
+        &enumerate_trident_managed_ukis(&esp.join(UKI_DIRECTORY))?,
+    )
 }
 
 /// Helper function to update the UKI boot files on the ESP and return the new
@@ -368,23 +398,17 @@ pub fn update_uki_boot_files(
     let existing_ukis = enumerate_trident_managed_ukis(&esp_uki_directory)
         .structured(ServicingError::EnumerateUkis)?;
     let uki_suffix = uki_suffix(ctx);
+    let uki_dest_path = esp_uki_directory
+        .join(next_uki_name(ctx, &existing_ukis).structured(ServicingError::UpdateUki)?);
 
     // Remove any leftover UKIs for the target slot (idempotent safety net —
     // cleanup_ukis_before_staging should have already removed these) and
     // compute the highest existing update index for the new filename.
-    let mut max_index = 99;
-    for (index, suffix, path) in existing_ukis {
+    for (_, suffix, path) in existing_ukis {
         if suffix == uki_suffix {
             remove_uki_and_addons(&path).structured(ServicingError::UpdateUki)?;
-        } else {
-            max_index = max_index.max(index);
         }
     }
-
-    let uki_dest_path = esp_uki_directory.join(format!(
-        "{UKI_FILENAME_PREFIX}{}-{uki_suffix}",
-        max_index + 1
-    ));
 
     // If there is a staged UKI addon directory, rename it to match the new UKI filename.
     let staging_addon_dir = esp_uki_directory.join(TMP_UKI_ADDON_DIR_NAME);
@@ -534,7 +558,7 @@ pub fn find_previous_uki(esp_dir_path: &Path) -> Result<PathBuf, TridentError> {
 /// servicing scenarios: per-slot verity addons (`slot-a.addon.efi`/
 /// `slot-b.addon.efi`) and the first-boot addon (see
 /// `enforce_firstboot_addon_policy`).
-const ACL_ADDON_TEMPLATES_DIR: &str = "acl/uki-addons";
+pub(crate) const ACL_ADDON_TEMPLATES_DIR: &str = "acl/uki-addons";
 
 /// Filename of the verity addon template for slot A, both in
 /// `ACL_ADDON_TEMPLATES_DIR` and in the staged UKI addon directory once

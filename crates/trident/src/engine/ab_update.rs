@@ -54,6 +54,10 @@ pub(super) fn stage_update(
         }
     };
 
+    let signed_usr = storage::signed_usr::prepare(&ctx)
+        .structured(ServicingError::DeployImages)
+        .message("Signed /usr update preflight failed")?;
+
     engine::prepare(subsystems, &ctx)?;
 
     debug!("Preparing storage to mount new root");
@@ -61,7 +65,7 @@ pub(super) fn stage_update(
     // Close any pre-existing verity devices
     verity::stop_trident_servicing_devices(&ctx.spec).structured(ServicingError::CleanupVerity)?;
 
-    storage::initialize_block_devices(&ctx)?;
+    storage::initialize_block_devices(&ctx, signed_usr.as_ref())?;
 
     // Extract the staging USR verity root hash from the COSI image metadata.
     // This is used to cryptographically verify that the active and staging USR
@@ -108,6 +112,17 @@ pub(super) fn stage_update(
 
     engine::clean_up(subsystems, &ctx)?;
 
+    let staged_signed_usr = signed_usr
+        .as_ref()
+        .map(|signed| {
+            let esp = container::get_host_relative_path(ctx.esp_mount_path.as_path().into())?;
+            signed
+                .staged_state(&ctx, &esp)
+                .structured(ServicingError::CreateVerity)
+                .message("Failed to record signed /usr staged artifacts")
+        })
+        .transpose()?;
+
     // At this point, deployment has been staged, so update servicing state
     debug!(
         "Updating host's servicing state to '{:?}'",
@@ -119,6 +134,7 @@ pub(super) fn stage_update(
             spec_old: ctx.spec_old,
             servicing_state: ServicingState::AbUpdateStaged,
             ab_active_volume: ctx.ab_active_volume,
+            staged_signed_usr,
             partition_paths: ctx.partition_paths,
             disk_uuids: ctx.disk_uuids,
             install_index: ctx.install_index,
@@ -171,7 +187,18 @@ pub(crate) fn finalize_update(
 
     let root_path = container::get_host_relative_path(PathBuf::from(ROOT_MOUNT_POINT_PATH))?;
     let esp_path = container::get_host_relative_path(ctx.esp_mount_path.as_path().into())?;
-    bootentries::create_and_update_boot_variables(&ctx, &esp_path)?;
+    let prepared_uki = storage::signed_usr::verify_staged_before_switch(
+        &ctx,
+        &esp_path,
+        state.host_status().staged_signed_usr.as_ref(),
+    )
+    .structured(ServicingError::CreateVerity)
+    .message("Signed /usr verification before boot switch failed")?;
+    bootentries::create_and_update_boot_variables_with_uki(
+        &ctx,
+        &esp_path,
+        prepared_uki.as_deref(),
+    )?;
     // Analogous to how UEFI variables are configured, finalize must start configuring
     // UEFI fallback, and a successful commit will finish it.
     esp::set_uefi_fallback_contents(&ctx, ServicingState::AbUpdateStaged, &root_path)

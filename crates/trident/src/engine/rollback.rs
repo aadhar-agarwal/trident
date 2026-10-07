@@ -21,7 +21,7 @@ use crate::{
     engine::{
         bootentries,
         context::{EngineContext, EngineContextParams},
-        storage::{encryption, verity},
+        storage::{encryption, signed_usr, verity},
     },
     health,
     subsystems::esp,
@@ -153,6 +153,7 @@ pub fn validate_boot(datastore: &mut DataStore) -> Result<BootValidationResult, 
                 host_status.spec = host_status.spec_old.clone();
                 host_status.spec_old = Default::default();
                 host_status.servicing_state = ServicingState::Provisioned;
+                host_status.staged_signed_usr = None;
             })?;
 
             return Err(TridentError::new(
@@ -169,6 +170,7 @@ pub fn validate_boot(datastore: &mut DataStore) -> Result<BootValidationResult, 
                 host_status.spec = host_status.spec_old.clone();
                 host_status.spec_old = Default::default();
                 host_status.servicing_state = ServicingState::Provisioned;
+                host_status.staged_signed_usr = None;
             })?;
 
             return Err(TridentError::new(ServicingError::AbUpdateRebootCheck {
@@ -184,6 +186,7 @@ pub fn validate_boot(datastore: &mut DataStore) -> Result<BootValidationResult, 
                 host_status.spec = host_status.spec_old.clone();
                 host_status.spec_old = Default::default();
                 host_status.servicing_state = ServicingState::Provisioned;
+                host_status.staged_signed_usr = None;
             })?;
 
             return Err(TridentError::new(
@@ -213,6 +216,8 @@ fn commit_finalized_on_expected_root(
     current_servicing_state: ServicingState,
     servicing_type: ServicingType,
 ) -> Result<BootValidationResult, TridentError> {
+    signed_usr::report_runtime_status(ctx);
+
     if matches!(
         servicing_type,
         ServicingType::CleanInstall | ServicingType::AbUpdate | ServicingType::ManualRollbackAb
@@ -319,6 +324,7 @@ fn commit_finalized_on_expected_root(
 
     datastore.with_host_status(|host_status| {
         host_status.servicing_state = ServicingState::Provisioned;
+        host_status.staged_signed_usr = None;
         host_status.spec_old = Default::default();
         host_status.ab_active_volume = match host_status.ab_active_volume {
             None | Some(AbVolumeSelection::VolumeB) => Some(AbVolumeSelection::VolumeA),

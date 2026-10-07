@@ -196,7 +196,7 @@ fn deploy_esp(ctx: &EngineContext, mount_point: &Path) -> Result<(), TridentErro
 /// that case create it with the mode `/var/tmp` is expected to have, so that we
 /// neither fail the deployment nor leave the installed system with a
 /// wrongly-permissioned directory.
-fn ensure_esp_extraction_dir(mount_point: &Path) -> Result<PathBuf, TridentError> {
+pub(crate) fn ensure_esp_extraction_dir(mount_point: &Path) -> Result<PathBuf, TridentError> {
     let esp_extraction_dir = path::join_relative(mount_point, ESP_EXTRACTION_DIRECTORY);
 
     if !esp_extraction_dir.exists() {

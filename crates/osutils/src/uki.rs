@@ -1,10 +1,12 @@
 use std::{
     ffi::OsString,
+    fs::File,
+    io::{Read, Seek, SeekFrom},
     os::unix::ffi::OsStringExt,
     path::{Path, PathBuf},
 };
 
-use anyhow::{Context, Error, Result};
+use anyhow::{ensure, Context, Error, Result};
 
 /// UKI Addon directory suffix.
 pub const UKI_ADDON_DIR_SUFFIX: &str = ".extra.d";
@@ -14,6 +16,66 @@ pub const UKI_ADDON_FILE_SUFFIX: &str = ".addon.efi";
 /// systemd credentials (produced by `systemd-creds`) and are consumed by
 /// systemd-stub at boot, alongside `.addon.efi` files.
 pub const UKI_CRED_FILE_SUFFIX: &str = ".cred";
+
+/// Reads the .cmdline section without executing tools from an unverified image
+/// or changing Authenticode-signed PE bytes.
+pub fn read_cmdline(path: impl AsRef<Path>) -> Result<String, Error> {
+    let mut file = File::open(path.as_ref())?;
+    let length = file.metadata()?.len();
+    let mut dos = [0u8; 64];
+    file.read_exact(&mut dos)?;
+    ensure!(&dos[..2] == b"MZ", "UKI/addon is not a PE file");
+    let pe_offset = u32::from_le_bytes(dos[60..64].try_into()?) as u64;
+    file.seek(SeekFrom::Start(pe_offset))?;
+    let mut pe = [0u8; 24];
+    file.read_exact(&mut pe)?;
+    ensure!(&pe[..4] == b"PE\0\0", "Invalid PE signature");
+    let sections = u16::from_le_bytes(pe[6..8].try_into()?);
+    let optional_size = u16::from_le_bytes(pe[20..22].try_into()?);
+    const SECTION_SIZE: u64 = 40;
+    const MAX_CMDLINE_SIZE: u64 = 64 * 1024;
+    let table = pe_offset + pe.len() as u64 + u64::from(optional_size);
+    ensure!(
+        table + u64::from(sections) * SECTION_SIZE <= length,
+        "Truncated PE section table"
+    );
+    let mut cmdline = None;
+    for i in 0..sections {
+        file.seek(SeekFrom::Start(table + u64::from(i) * SECTION_SIZE))?;
+        let mut section = [0u8; SECTION_SIZE as usize];
+        file.read_exact(&mut section)?;
+        if &section[..8] != b".cmdline" {
+            continue;
+        }
+        ensure!(cmdline.is_none(), "Duplicate PE .cmdline section");
+        let virtual_size = u32::from_le_bytes(section[8..12].try_into()?) as u64;
+        let size = u32::from_le_bytes(section[16..20].try_into()?) as u64;
+        let offset = u32::from_le_bytes(section[20..24].try_into()?) as u64;
+        ensure!(
+            virtual_size > 0
+                && virtual_size <= size
+                && size <= MAX_CMDLINE_SIZE
+                && offset >= table + u64::from(sections) * SECTION_SIZE
+                && offset + size <= length,
+            "Invalid PE .cmdline bounds"
+        );
+        file.seek(SeekFrom::Start(offset))?;
+        let mut bytes = vec![0; size as usize];
+        file.read_exact(&mut bytes)?;
+        ensure!(
+            bytes[virtual_size as usize..].iter().all(|b| *b == 0),
+            "Nonzero bytes outside PE .cmdline virtual size"
+        );
+        bytes.truncate(virtual_size as usize);
+        let end = bytes.iter().position(|b| *b == 0).unwrap_or(bytes.len());
+        ensure!(
+            bytes[end..].iter().all(|b| *b == 0),
+            "Nonzero PE .cmdline padding"
+        );
+        cmdline = Some(String::from_utf8(bytes[..end].to_vec())?);
+    }
+    Ok(cmdline.unwrap_or_default())
+}
 
 /// Returns the path to the addon directory associated with the given UKI file,
 /// which is expected to be named `<UKI_filename>.extra.d/`. For example, if the
@@ -64,7 +126,53 @@ pub fn get_uki_name_from_addon_file(addon_file: &Path) -> Result<OsString, Error
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::TempDir;
+
+    use std::{fs, io::Write};
+
+    use tempfile::{NamedTempFile, TempDir};
+
+    fn cmdline_pe(cmdline: &[u8]) -> Vec<u8> {
+        let mut pe = vec![0; 128];
+        pe[..2].copy_from_slice(b"MZ");
+        pe[60..64].copy_from_slice(&64u32.to_le_bytes());
+        pe[64..68].copy_from_slice(b"PE\0\0");
+        pe[70..72].copy_from_slice(&1u16.to_le_bytes());
+        pe[88..96].copy_from_slice(b".cmdline");
+        pe[96..100].copy_from_slice(&(cmdline.len() as u32).to_le_bytes());
+        pe[104..108].copy_from_slice(&(cmdline.len() as u32).to_le_bytes());
+        pe[108..112].copy_from_slice(&128u32.to_le_bytes());
+        pe.extend_from_slice(cmdline);
+        pe
+    }
+
+    #[test]
+    fn reads_cmdline_without_modifying_signed_bytes() {
+        let bytes = cmdline_pe(b"usrhash=abc\0\0");
+        let mut file = NamedTempFile::new().unwrap();
+        file.write_all(&bytes).unwrap();
+        assert_eq!(read_cmdline(file.path()).unwrap(), "usrhash=abc");
+        assert_eq!(fs::read(file.path()).unwrap(), bytes);
+    }
+
+    #[test]
+    fn rejects_truncated_and_ambiguous_cmdline_sections() {
+        let mut truncated = cmdline_pe(b"value\0");
+        truncated.pop();
+        let mut duplicate = cmdline_pe(&[0; 80]);
+        duplicate[70..72].copy_from_slice(&2u16.to_le_bytes());
+        let section = duplicate[88..128].to_vec();
+        duplicate[128..168].copy_from_slice(&section);
+        for bytes in [
+            truncated,
+            duplicate,
+            cmdline_pe(b"value\0junk"),
+            b"not PE".to_vec(),
+        ] {
+            let mut file = NamedTempFile::new().unwrap();
+            file.write_all(&bytes).unwrap();
+            read_cmdline(file.path()).unwrap_err();
+        }
+    }
 
     /// Validates that `uki_addon_dir` appends the `.extra.d` suffix to the
     /// UKI file path to form the addon directory path.

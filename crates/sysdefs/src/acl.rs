@@ -13,3 +13,9 @@ pub const ACL_USR_B_PARTUUID: Uuid = uuid!("e03dd35c-7c2d-4a47-b3fe-27f15780a57c
 
 /// ACL USR partition type UUID.
 pub const ACL_USR_PARTITION_TYPE_UUID: Uuid = uuid!("5dfbf5f4-2848-4bac-aa5e-0d9a20b745a6");
+
+/// ACL detached /usr root-hash signature partition A PARTUUID.
+pub const ACL_HASH_SIG_A_PARTUUID: Uuid = uuid!("3514648f-e3da-44ae-89ba-8d0552418f88");
+
+/// ACL detached /usr root-hash signature partition B PARTUUID.
+pub const ACL_HASH_SIG_B_PARTUUID: Uuid = uuid!("d8941eb2-f713-4bb6-b4ae-bd8350ca27d4");

@@ -44,6 +44,7 @@ pub mod udevadm;
 pub mod uki;
 pub mod uname;
 pub mod verity_roothash;
+pub mod verity_signature;
 pub mod veritysetup;
 pub mod virt;
 pub mod wipefs;

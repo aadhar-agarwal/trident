@@ -56,6 +56,16 @@ pub fn create_and_update_boot_variables(
     ctx: &EngineContext,
     esp_path: &Path,
 ) -> Result<(), TridentError> {
+    create_and_update_boot_variables_with_uki(ctx, esp_path, None)
+}
+
+/// `prepared_uki` is already verified and renamed by signed finalization,
+/// including retries after the staged UKI filename has disappeared.
+pub(crate) fn create_and_update_boot_variables_with_uki(
+    ctx: &EngineContext,
+    esp_path: &Path,
+    prepared_uki: Option<&str>,
+) -> Result<(), TridentError> {
     // Get the label and path for the EFI bootloader of the inactive A/B update volume.
     let (entry_label_new, bootloader_path_new) =
         get_label_and_path(ctx, BOOT_EFI).structured(ServicingError::GetLabelAndPath)?;
@@ -113,11 +123,13 @@ pub fn create_and_update_boot_variables(
     // Update boot variables
     set_boot_next_and_update_boot_order(ctx, added_entry_numbers)?;
 
-    if uki::is_staged(esp_path) {
-        let oneshot = !matches!(
-            ctx.servicing_type,
-            ServicingType::CleanInstall | ServicingType::ManualRollbackAb
-        );
+    let oneshot = !matches!(
+        ctx.servicing_type,
+        ServicingType::CleanInstall | ServicingType::ManualRollbackAb
+    );
+    if let Some(entry) = prepared_uki {
+        uki::select_uki_boot_entry(entry, oneshot)?;
+    } else if uki::is_staged(esp_path) {
         uki::update_uki_boot_order(ctx, esp_path, oneshot)?;
     }
 

@@ -204,6 +204,9 @@ fn stage_clean_install(
 
     ctx.populate_filesystems()?;
 
+    // Reject unsupported signed layouts before partitioning or clearing state.
+    let signed_usr = storage::signed_usr::prepare(&ctx).structured(ServicingError::DeployImages)?;
+
     // Need to re-set saved Host Status in case another clean install has been previously staged
     debug!("Clearing saved Host Status");
     state.with_host_status(|host_status| {
@@ -215,7 +218,7 @@ fn stage_clean_install(
 
     debug!("Preparing storage to mount new root");
     storage::create_block_devices(&mut ctx)?;
-    storage::initialize_block_devices(&ctx)?;
+    storage::initialize_block_devices(&ctx, signed_usr.as_ref())?;
     let newroot_mount = NewrootMount::create_and_mount(
         host_config,
         &ctx.partition_paths,
@@ -264,6 +267,7 @@ fn stage_clean_install(
             spec: ctx.spec,
             spec_old: Default::default(),
             ab_active_volume: None,
+            staged_signed_usr: None,
             partition_paths: ctx.partition_paths,
             disk_uuids: ctx.disk_uuids,
             install_index: ctx.install_index,

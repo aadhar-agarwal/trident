@@ -298,6 +298,7 @@ impl OsImageFileSystem {
     }
 }
 
+#[derive(Clone)]
 pub struct OsImageFile {
     pub compressed_size: u64,
     pub sha384: Sha384Hash,

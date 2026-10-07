@@ -43,6 +43,11 @@ pub struct HostStatus {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ab_active_volume: Option<AbVolumeSelection>,
 
+    /// Durable signed-servicing requirement and expected artifacts. Missing on
+    /// legacy staged updates; never inferred from mutable ESP files on resume.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub staged_signed_usr: Option<StagedSignedUsr>,
+
     /// The UUID for each disk.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub disk_uuids: HashMap<BlockDeviceId, Uuid>,
@@ -66,6 +71,30 @@ pub struct HostStatus {
     /// Version of Trident that last updated this HostStatus.
     #[serde(default, skip_serializing_if = "TridentVersion::is_none")]
     pub trident_version: TridentVersion,
+}
+
+/// Verified inactive /usr tuple and boot assets retained across finalize retries.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct StagedSignedUsr {
+    pub target_volume: AbVolumeSelection,
+    pub root_hash: String,
+    /// Data, hash tree, and raw signature partition, in that order.
+    pub partitions: [StagedSignedUsrPartition; 3],
+    /// Final basename chosen before either ESP asset rename.
+    pub uki_name: String,
+    pub uki_sha384: String,
+    /// Basenames and hashes of the entire per-UKI addon directory.
+    pub addons: BTreeMap<String, String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct StagedSignedUsrPartition {
+    pub id: BlockDeviceId,
+    pub part_uuid: Uuid,
+    pub size: u64,
+    pub sha384: String,
 }
 
 /// Servicing type is the type of servicing that the Trident agent is executing on the host.
